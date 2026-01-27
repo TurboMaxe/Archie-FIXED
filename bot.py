@@ -3,6 +3,7 @@ import discord
 import requests
 import os
 import io
+import json
 import asyncio
 from datetime import datetime, time, timedelta
 import zoneinfo
@@ -12,6 +13,8 @@ from typing import Optional, Dict, Any
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+YEARLY_STATS_FILE = "yearly_stats.json"
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s:%(name)s: %(message)s')
 logger = logging.getLogger('archie-bot')
@@ -33,6 +36,48 @@ def reset_daily_stats():
     daily_stats["guild_usage"] = defaultdict(int)
     daily_stats["guild_names"] = {}
     daily_stats["start_time"] = datetime.now()
+
+# Yearly stats persistence
+def load_yearly_stats():
+    try:
+        with open(YEARLY_STATS_FILE, "r") as f:
+            data = json.load(f)
+            return {
+                "year": data.get("year", datetime.now().year),
+                "commands": defaultdict(int, data.get("commands", {})),
+                "total_commands": data.get("total_commands", 0),
+                "guild_usage": defaultdict(int, data.get("guild_usage", {})),
+                "guild_names": data.get("guild_names", {}),
+            }
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {
+            "year": datetime.now().year,
+            "commands": defaultdict(int),
+            "total_commands": 0,
+            "guild_usage": defaultdict(int),
+            "guild_names": {},
+        }
+
+def save_yearly_stats():
+    data = {
+        "year": yearly_stats["year"],
+        "commands": dict(yearly_stats["commands"]),
+        "total_commands": yearly_stats["total_commands"],
+        "guild_usage": dict(yearly_stats["guild_usage"]),
+        "guild_names": yearly_stats["guild_names"],
+    }
+    with open(YEARLY_STATS_FILE, "w") as f:
+        json.dump(data, f)
+
+def reset_yearly_stats():
+    yearly_stats["year"] = datetime.now().year
+    yearly_stats["commands"] = defaultdict(int)
+    yearly_stats["total_commands"] = 0
+    yearly_stats["guild_usage"] = defaultdict(int)
+    yearly_stats["guild_names"] = {}
+    save_yearly_stats()
+
+yearly_stats = load_yearly_stats()
 
 def generate_stats_chart():
     commands = dict(daily_stats["commands"])
@@ -109,6 +154,77 @@ async def send_daily_recap():
     
     reset_daily_stats()
 
+def generate_yearly_wrapped_chart():
+    commands = dict(yearly_stats["commands"])
+    if not commands:
+        return None
+    
+    sorted_cmds = sorted(commands.items(), key=lambda x: x[1], reverse=True)[:10]
+    names = [cmd for cmd, _ in sorted_cmds]
+    counts = [count for _, count in sorted_cmds]
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    colors = plt.cm.viridis([i/len(names) for i in range(len(names))])
+    bars = ax.barh(names, counts, color=colors)
+    ax.set_xlabel('Usage Count', fontsize=14)
+    ax.set_title(f'🎉 Archie Wrapped {yearly_stats["year"]} 🎉', fontsize=20, fontweight='bold')
+    ax.invert_yaxis()
+    
+    for bar, count in zip(bars, counts):
+        ax.text(bar.get_width() + max(counts)*0.01, bar.get_y() + bar.get_height()/2, 
+                f'{count:,}', va='center', fontsize=12, fontweight='bold')
+    
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+async def send_yearly_wrapped():
+    channel = bot.get_channel(STATS_CHANNEL)
+    if not channel:
+        return
+    
+    year = yearly_stats["year"]
+    total_commands = yearly_stats["total_commands"]
+    total_servers = len(yearly_stats["guild_usage"])
+    
+    embed = discord.Embed(
+        title=f"🎉 Archie Wrapped {year} 🎉",
+        description=f"Here's your year in review!",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="📊 Total Commands", value=f"`{total_commands:,}`", inline=True)
+    embed.add_field(name="🌐 Servers Reached", value=f"`{total_servers}`", inline=True)
+    
+    # Top commands
+    if yearly_stats["commands"]:
+        top_cmds = sorted(yearly_stats["commands"].items(), key=lambda x: x[1], reverse=True)[:5]
+        top_text = "\n".join([f"**{i+1}.** `/{cmd}` — {count:,} uses" for i, (cmd, count) in enumerate(top_cmds)])
+        embed.add_field(name="🏆 Top Commands", value=top_text, inline=False)
+    
+    # Top servers
+    if yearly_stats["guild_usage"]:
+        top_guilds = sorted(yearly_stats["guild_usage"].items(), key=lambda x: x[1], reverse=True)[:5]
+        top_guilds_text = "\n".join([
+            f"**{i+1}.** {yearly_stats['guild_names'].get(str(gid), 'Unknown')} — {count:,} commands"
+            for i, (gid, count) in enumerate(top_guilds)
+        ])
+        embed.add_field(name="🏅 Top Servers", value=top_guilds_text, inline=False)
+    
+    embed.set_footer(text=f"Thank you for an amazing {year}! 💜")
+    
+    chart = generate_yearly_wrapped_chart()
+    if chart:
+        file = discord.File(chart, filename="wrapped.png")
+        embed.set_image(url="attachment://wrapped.png")
+        await channel.send(embed=embed, file=file)
+    else:
+        await channel.send(embed=embed)
+    
+    reset_yearly_stats()
+
 async def daily_recap_loop():
     await bot.wait_until_ready()
     denmark_tz = zoneinfo.ZoneInfo("Europe/Copenhagen")
@@ -118,6 +234,12 @@ async def daily_recap_loop():
         tomorrow = datetime(now.year, now.month, now.day, tzinfo=denmark_tz) + timedelta(days=1)
         seconds_until_midnight = (tomorrow - now).total_seconds()
         await asyncio.sleep(seconds_until_midnight)
+        
+        # Check if it's New Year (Jan 1st) - send wrapped for previous year
+        now = datetime.now(denmark_tz)
+        if now.month == 1 and now.day == 1:
+            await send_yearly_wrapped()
+        
         await send_daily_recap()
 
 @bot.slash_command(
@@ -701,12 +823,20 @@ async def on_ready():
 async def on_application_command(ctx):
     logger.info(f"/{ctx.command.name} used by {ctx.author} in {getattr(ctx.guild, 'name', 'DM')}")
     
-    # Track stats (no message sent, just counting for daily recap)
+    # Track daily stats
     daily_stats["commands"][ctx.command.name] += 1
     if ctx.guild:
         daily_stats["guilds"].add(ctx.guild.id)
         daily_stats["guild_usage"][ctx.guild.id] += 1
         daily_stats["guild_names"][ctx.guild.id] = ctx.guild.name
+    
+    # Track yearly stats
+    yearly_stats["commands"][ctx.command.name] += 1
+    yearly_stats["total_commands"] += 1
+    if ctx.guild:
+        yearly_stats["guild_usage"][str(ctx.guild.id)] += 1
+        yearly_stats["guild_names"][str(ctx.guild.id)] = ctx.guild.name
+    save_yearly_stats()
 
 
 @bot.event
