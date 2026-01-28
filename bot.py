@@ -1,10 +1,12 @@
 import logging
 import discord
-import requests
+import aiohttp
 import os
 import io
 import json
 import asyncio
+import re
+import filelock
 from datetime import datetime, time, timedelta
 import zoneinfo
 from collections import defaultdict
@@ -15,11 +17,78 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw, ImageFont
 
+# === SECURITY: Rate limiting / cooldowns ===
+from discord.ext import commands
+user_cooldowns: Dict[int, datetime] = {}
+COOLDOWN_SECONDS = 3
+
+def check_cooldown(user_id: int) -> bool:
+    """Returns True if user is on cooldown (should be blocked)"""
+    now = datetime.now()
+    if user_id in user_cooldowns:
+        elapsed = (now - user_cooldowns[user_id]).total_seconds()
+        if elapsed < COOLDOWN_SECONDS:
+            return True
+    user_cooldowns[user_id] = now
+    return False
+
+# === SECURITY: Username sanitization ===
+USERNAME_REGEX = re.compile(r'^[a-zA-Z0-9_]{1,16}$')
+
+def sanitize_username(username: str) -> Optional[str]:
+    """Validate and sanitize Minecraft username. Returns None if invalid."""
+    username = username.strip()[:16]
+    if USERNAME_REGEX.match(username):
+        return username
+    return None
+
+# === SECURITY: Safe JSON file operations with file locking ===
+def safe_json_load(filepath: str, default: dict) -> dict:
+    """Safely load JSON with file locking to prevent corruption."""
+    lock = filelock.FileLock(f"{filepath}.lock", timeout=5)
+    try:
+        with lock:
+            if os.path.exists(filepath):
+                with open(filepath, "r") as f:
+                    return json.load(f)
+    except (json.JSONDecodeError, filelock.Timeout, Exception) as e:
+        logging.getLogger('archie-bot').error(f"Failed to load {filepath}: {e}")
+    return default
+
+def safe_json_save(filepath: str, data: dict) -> bool:
+    """Safely save JSON with file locking and atomic write."""
+    lock = filelock.FileLock(f"{filepath}.lock", timeout=5)
+    try:
+        with lock:
+            tmp_path = f"{filepath}.tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, filepath)
+            return True
+    except (filelock.Timeout, Exception) as e:
+        logging.getLogger('archie-bot').error(f"Failed to save {filepath}: {e}")
+    return False
+
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template.png")
 FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "PixelifySans.ttf")
 STEVE_HEAD_URL = "https://mc-heads.net/avatar/MHF_Steve/80"
 
-def generate_lifestats_card(username: str, uuid: str, statistics: dict, profile: dict) -> io.BytesIO:
+async def fetch_player_head(uuid: str) -> Optional[bytes]:
+    """Async fetch player head with timeout protection."""
+    head_urls = [f"https://mc-heads.net/avatar/{uuid}/80", STEVE_HEAD_URL]
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+        for url in head_urls:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        if len(data) > 100:
+                            return data
+            except:
+                continue
+    return None
+
+def generate_lifestats_card(username: str, uuid: str, statistics: dict, profile: dict, head_data: Optional[bytes] = None) -> io.BytesIO:
     from PIL import ImageFilter
     
     # Colors (Minecraft style)
@@ -50,22 +119,17 @@ def generate_lifestats_card(username: str, uuid: str, statistics: dict, profile:
         font_small = font_large
         font_tiny = font_large
     
-    # Get player head - try player UUID first, then fall back to Steve
+    # Use pre-fetched head data or create placeholder
     skin_img = None
-    head_urls = [f"https://mc-heads.net/avatar/{uuid}/80", STEVE_HEAD_URL]
-    
-    for skin_url in head_urls:
+    if head_data:
         try:
-            resp = requests.get(skin_url, timeout=5)
-            if resp.status_code == 200 and len(resp.content) > 100:
-                skin_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-                if skin_img.size[0] > 0 and skin_img.size[1] > 0:
-                    break
+            skin_img = Image.open(io.BytesIO(head_data)).convert("RGBA")
+            if skin_img.size[0] <= 0 or skin_img.size[1] <= 0:
                 skin_img = None
         except:
-            continue
+            skin_img = None
     
-    # Final fallback - create a Steve-colored placeholder if all requests failed
+    # Final fallback - create a Steve-colored placeholder
     if skin_img is None:
         skin_img = Image.new("RGBA", (80, 80), (139, 90, 43, 255))
     
@@ -177,26 +241,25 @@ def reset_daily_stats():
     daily_stats["guild_names"] = {}
     daily_stats["start_time"] = datetime.now()
 
-# Yearly stats persistence
+# Yearly stats persistence (using safe JSON operations)
 def load_yearly_stats():
-    try:
-        with open(YEARLY_STATS_FILE, "r") as f:
-            data = json.load(f)
-            return {
-                "year": data.get("year", datetime.now().year),
-                "commands": defaultdict(int, data.get("commands", {})),
-                "total_commands": data.get("total_commands", 0),
-                "guild_usage": defaultdict(int, data.get("guild_usage", {})),
-                "guild_names": data.get("guild_names", {}),
-            }
-    except (FileNotFoundError, json.JSONDecodeError):
+    default = {
+        "year": datetime.now().year,
+        "commands": defaultdict(int),
+        "total_commands": 0,
+        "guild_usage": defaultdict(int),
+        "guild_names": {},
+    }
+    data = safe_json_load(YEARLY_STATS_FILE, {})
+    if data:
         return {
-            "year": datetime.now().year,
-            "commands": defaultdict(int),
-            "total_commands": 0,
-            "guild_usage": defaultdict(int),
-            "guild_names": {},
+            "year": data.get("year", datetime.now().year),
+            "commands": defaultdict(int, data.get("commands", {})),
+            "total_commands": data.get("total_commands", 0),
+            "guild_usage": defaultdict(int, data.get("guild_usage", {})),
+            "guild_names": data.get("guild_names", {}),
         }
+    return default
 
 def save_yearly_stats():
     data = {
@@ -206,8 +269,7 @@ def save_yearly_stats():
         "guild_usage": dict(yearly_stats["guild_usage"]),
         "guild_names": yearly_stats["guild_names"],
     }
-    with open(YEARLY_STATS_FILE, "w") as f:
-        json.dump(data, f)
+    safe_json_save(YEARLY_STATS_FILE, data)
 
 def reset_yearly_stats():
     yearly_stats["year"] = datetime.now().year
@@ -402,11 +464,17 @@ async def daily_recap_loop():
     ]
 )
 async def balance(ctx: discord.ApplicationContext, gamemode: str, username: str):
+    if check_cooldown(ctx.author.id):
+        await ctx.respond("Please wait a few seconds before using commands again.", ephemeral=True)
+        return
+    
+    safe_username = sanitize_username(username)
+    if not safe_username:
+        await ctx.respond("Invalid username.", ephemeral=True)
+        return
+    
     await ctx.defer()
     try:
-        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
-        username_lower = username.lower()
-        # Map gamemode to balance key in balances dict
         type_map = {
             "lifesteal": "lifesteal-coins",
             "survival": "gems",
@@ -418,43 +486,38 @@ async def balance(ctx: discord.ApplicationContext, gamemode: str, username: str)
         if not bal_type:
             await ctx.respond("Invalid gamemode selected.")
             return
-        url = f"https://api.arch.mc/v1/economy/player/username/{username_lower}"
-        headers = {"X-API-KEY": API_KEY}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
+        
+        client = get_api_client()
+        data = await client.get(f"/v1/economy/player/username/{safe_username}")
+        
+        if data and isinstance(data, dict):
             balances = data.get("balances", {})
             if not balances:
-                await ctx.respond(f"No balance data found for {username}. The player may not have played any supported gamemode yet.")
+                await ctx.respond(f"No balance data found for {safe_username}.")
                 return
             if bal_type in balances:
-                balance = balances[bal_type]
+                bal = balances[bal_type]
                 embed = discord.Embed(
-                    title=f"💰 {gamemode.capitalize()} Balance for {username}",
-                    description=f"**{balance:,}**",
+                    title=f"💰 {gamemode.capitalize()} Balance for {safe_username}",
+                    description=f"**{bal:,}**",
                     color=discord.Color.gold()
                 )
                 embed.set_footer(text=f"ArchMC {gamemode.capitalize()} • Official API")
                 await ctx.respond(embed=embed)
             else:
-                # Show all available balances for the player
                 bal_lines = [f"**{k.replace('-', ' ').title()}**: `{v:,}`" for k, v in balances.items()]
                 embed = discord.Embed(
-                    title=f"💰 All Balances for {username}",
+                    title=f"💰 All Balances for {safe_username}",
                     description="\n".join(bal_lines),
                     color=discord.Color.gold()
                 )
                 embed.set_footer(text="ArchMC Economy • Official API")
-                await ctx.respond(
-                    content=f"No {gamemode} balance found for {username}. Showing all available balances:",
-                    embed=embed
-                )
-        elif response.status_code == 404:
-            await ctx.respond(f"No balance profile found for **{username}**. The player may not exist or has never played on ArchMC.")
+                await ctx.respond(embed=embed)
         else:
-            await ctx.respond(f"Failed to fetch balance for {username} in {gamemode}. (Status code: {response.status_code})")
+            await ctx.respond(f"No balance profile found for **{safe_username}**.")
     except Exception as e:
-        await ctx.respond(f"Failed to fetch balance: {e}")
+        logger.error(f"balance error: {e}")
+        await ctx.respond("Failed to fetch balance. Please try again later.")
 
 # /dueltop - Top players for a duel stat (ELO, wins, etc.)
 @bot.slash_command(
@@ -478,14 +541,15 @@ async def balance(ctx: discord.ApplicationContext, gamemode: str, username: str)
     ]
 )
 async def dueltop(ctx: discord.ApplicationContext, statid: str):
+    if check_cooldown(ctx.author.id):
+        await ctx.respond("Please wait a few seconds before using commands again.", ephemeral=True)
+        return
+    
     await ctx.defer()
     try:
-        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
-        url = f"https://api.arch.mc/v1/leaderboards/{statid}?page=0&size=10"
-        headers = {"X-API-KEY": API_KEY}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
+        client = get_api_client()
+        data = await client.get(f"/v1/leaderboards/{statid}?page=0&size=10")
+        if data and isinstance(data, dict):
             entries = data.get("entries") or data.get("leaderboard") or []
             if isinstance(entries, list) and entries:
                 leaderboard_lines = [
@@ -503,9 +567,10 @@ async def dueltop(ctx: discord.ApplicationContext, statid: str):
             else:
                 await ctx.respond("No duel leaderboard data found.")
         else:
-            await ctx.respond(f"Failed to fetch duel leaderboard. Status code: {response.status_code}")
+            await ctx.respond("No duel leaderboard data found.")
     except Exception as e:
-        await ctx.respond(f"Failed to fetch duel leaderboard: {e}")
+        logger.error(f"dueltop error: {e}")
+        await ctx.respond("Failed to fetch duel leaderboard. Please try again later.")
 
 # /duelstats - All duel stats for a username
 
@@ -607,18 +672,23 @@ class DuelStatsView(View):
     ]
 )
 async def duelstats(ctx: discord.ApplicationContext, username: str):
+    if check_cooldown(ctx.author.id):
+        await ctx.respond("Please wait a few seconds before using commands again.", ephemeral=True)
+        return
+    
+    safe_username = sanitize_username(username)
+    if not safe_username:
+        await ctx.respond("Invalid username.", ephemeral=True)
+        return
+    
     await ctx.defer()
-    import traceback
     try:
-        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
-        url = f"https://api.arch.mc/v1/players/username/{username.lower()}/statistics"
-        headers = {"X-API-KEY": API_KEY}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
+        client = get_api_client()
+        data = await client.get(f"/v1/players/username/{safe_username}/statistics")
+        if data and isinstance(data, dict):
             statistics = data.get("statistics", {})
             duel_stats = {k: v for k, v in statistics.items() if k.startswith("elo:") or k.startswith("wins:")}
-            logger.info(f"[duelstats] username={username} duel_stats_keys={list(duel_stats.keys())}")
+            logger.info(f"[duelstats] username={safe_username} duel_stats_keys={list(duel_stats.keys())}")
             if duel_stats:
                 try:
                     from collections import defaultdict
@@ -668,19 +738,19 @@ async def duelstats(ctx: discord.ApplicationContext, username: str):
                             mode_stats["other"]["OTHER"].append((k, v))
                     mode_keys = sorted(mode_stats.keys())
                     page = 0
-                    embed = build_duelstats_embed(data, username, mode_stats, mode_labels, mode_keys, page, 4)
-                    view = DuelStatsView(data, username, mode_stats, mode_labels, mode_keys, page)
+                    embed = build_duelstats_embed(data, safe_username, mode_stats, mode_labels, mode_keys, page, 4)
+                    view = DuelStatsView(data, safe_username, mode_stats, mode_labels, mode_keys, page)
                     await ctx.respond(embed=embed, view=view)
                 except Exception as group_exc:
-                    logger.error(f"[duelstats] Grouping error for {username}: {group_exc}\n{traceback.format_exc()}")
+                    logger.error(f"[duelstats] Grouping error for {safe_username}: {group_exc}")
                     await ctx.respond("Failed to format duel stats.")
             else:
                 await ctx.respond("No duel stats found for that player.")
         else:
-            await ctx.respond(f"Failed to fetch duel stats. Status code: {response.status_code}")
+            await ctx.respond("No duel stats found for that player.")
     except Exception as e:
-        logger.error(f"[duelstats] Exception for {username}: {e}\n{traceback.format_exc()}")
-        await ctx.respond(f"Failed to fetch duel stats: {e}")
+        logger.error(f"[duelstats] Exception for {safe_username}: {e}")
+        await ctx.respond("Failed to fetch duel stats. Please try again later.")
 
 
 # Load channel IDs from environment
@@ -705,11 +775,14 @@ BOT_STATUS_CHANNEL = 1454137711140147332
     ]
 )
 async def lifetop(ctx: discord.ApplicationContext, stat: str):
+    if check_cooldown(ctx.author.id):
+        await ctx.respond("Please wait a few seconds before using commands again.", ephemeral=True)
+        return
+    
     await ctx.defer()
     try:
-        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
-        client = PIGDIClient(API_KEY)
-        leaderboard = client.get_ugc_leaderboard("trojan", stat)
+        client = get_api_client()
+        leaderboard = await client.get_ugc_leaderboard("trojan", stat)
         if leaderboard and "entries" in leaderboard:
             leaderboard_lines = [
                 f"**#{entry.get('position', i+1)}** {entry.get('username', 'Unknown')} — `{entry.get('value', 0)}`"
@@ -744,23 +817,48 @@ async def lifetop(ctx: discord.ApplicationContext, stat: str):
     ]
 )
 async def lifestats(ctx: discord.ApplicationContext, username: str):
+    # Rate limit check
+    if check_cooldown(ctx.author.id):
+        await ctx.respond("Please wait a few seconds before using commands again.", ephemeral=True)
+        return
+    
+    # Username sanitization
+    safe_username = sanitize_username(username)
+    if not safe_username:
+        await ctx.respond("Invalid username. Use only letters, numbers, and underscores (max 16 chars).", ephemeral=True)
+        return
+    
     await ctx.defer()
     try:
-        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
-        client = PIGDIClient(API_KEY)
-        username_lower = username.lower()
-        # Get stats
-        stats = client._request("GET", f"/v1/ugc/trojan/players/username/{username_lower}/statistics")
-        # Get profile
-        profile = client._request("GET", f"/v1/ugc/trojan/players/username/{username_lower}/profile")
+        client = get_api_client()
+        # Async API calls
+        stats, profile = await asyncio.gather(
+            client.get(f"/v1/ugc/trojan/players/username/{safe_username}/statistics"),
+            client.get(f"/v1/ugc/trojan/players/username/{safe_username}/profile"),
+            return_exceptions=True
+        )
+        
+        if isinstance(stats, Exception):
+            stats = None
+        if isinstance(profile, Exception):
+            profile = None
+            
         if stats and isinstance(stats, dict):
-            username_disp = stats.get("username", username)
+            username_disp = stats.get("username", safe_username)
             uuid = stats.get("uuid", "")
             statistics = stats.get("statistics", {})
             
-            # Generate card image
+            # Fetch head async (non-blocking)
+            head_data = await fetch_player_head(uuid)
+            
+            # Generate card in thread pool to prevent CPU blocking
             try:
-                card = generate_lifestats_card(username_disp, uuid, statistics, profile or {})
+                loop = asyncio.get_event_loop()
+                card = await loop.run_in_executor(
+                    None, 
+                    generate_lifestats_card, 
+                    username_disp, uuid, statistics, profile or {}, head_data
+                )
                 file = discord.File(card, filename="lifestats.png")
                 await ctx.respond(file=file)
             except Exception as card_error:
@@ -795,7 +893,8 @@ async def lifestats(ctx: discord.ApplicationContext, username: str):
         else:
             await ctx.respond("No stats found for that player.")
     except Exception as e:
-        await ctx.respond(f"Failed to fetch stats: {e}")
+        logger.error(f"lifestats error: {e}")
+        await ctx.respond("Failed to fetch stats. Please try again later.")
 
 # /lifestat - Specific Lifesteal stat for a username
 
@@ -849,43 +948,49 @@ def stat_to_embed(stat: dict, stat_name: str, username: str) -> discord.Embed:
     ]
 )
 async def lifestat(ctx: discord.ApplicationContext, username: str, stat: str):
+    if check_cooldown(ctx.author.id):
+        await ctx.respond("Please wait a few seconds before using commands again.", ephemeral=True)
+        return
+    
+    safe_username = sanitize_username(username)
+    if not safe_username:
+        await ctx.respond("Invalid username.", ephemeral=True)
+        return
+    
     await ctx.defer()
     try:
-        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
-        client = PIGDIClient(API_KEY)
-        username_lower = username.lower()
-        # Try to get detailed stat info (with rank/percentile)
-        stat_info = client._request("GET", f"/v1/ugc/trojan/players/username/{username_lower}/statistics/{stat}")
+        client = get_api_client()
+        stat_info = await client.get(f"/v1/ugc/trojan/players/username/{safe_username}/statistics/{stat}")
         if stat_info and isinstance(stat_info, dict) and "value" in stat_info:
-            embed = stat_to_embed(stat_info, stat, username)
+            embed = stat_to_embed(stat_info, stat, safe_username)
             await ctx.respond(embed=embed)
         else:
-            # fallback: try to get value from summary stats
-            stats = client.get_ugc_player_stats_by_username("trojan", username_lower)
+            stats = await client.get_ugc_player_stats_by_username("trojan", safe_username)
             stat_val = stats["statistics"].get(stat) if stats and "statistics" in stats and stat in stats["statistics"] else None
             if stat_val is not None:
-                # If fallback is just a value, wrap in dict
                 if not isinstance(stat_val, dict):
                     stat_val = {"value": stat_val}
-                embed = stat_to_embed(stat_val, stat, username)
+                embed = stat_to_embed(stat_val, stat, safe_username)
                 await ctx.respond(embed=embed)
             else:
                 await ctx.respond("No data found for that player/stat.")
     except Exception as e:
-        await ctx.respond(f"Failed to fetch stat: {e}")
+        logger.error(f"lifestat error: {e}")
+        await ctx.respond("Failed to fetch stat. Please try again later.")
 
 
 # /clantop - Top Clans Leaderboard
 @bot.slash_command(name="clantop", description="Show the top clans from ArchMC")
 async def clantop(ctx: discord.ApplicationContext):
+    if check_cooldown(ctx.author.id):
+        await ctx.respond("Please wait a few seconds before using commands again.", ephemeral=True)
+        return
+    
     await ctx.defer()
     try:
-        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
-        url = "https://api.arch.mc/v1/ugc/trojan/clans?page=0&size=10"
-        headers = {"X-API-KEY": API_KEY}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
+        client = get_api_client()
+        data = await client.get("/v1/ugc/trojan/clans?page=0&size=10")
+        if data and isinstance(data, dict):
             clans = data.get("clans") or data.get("entries") or data.get("leaderboard") or []
             if isinstance(clans, list) and clans:
                 leaderboard_lines = []
@@ -908,9 +1013,10 @@ async def clantop(ctx: discord.ApplicationContext):
             else:
                 await ctx.respond("No clan leaderboard data found.")
         else:
-            await ctx.respond(f"Failed to fetch clan leaderboard. Status code: {response.status_code}")
+            await ctx.respond("No clan leaderboard data found.")
     except Exception as e:
-        await ctx.respond(f"Failed to fetch clan leaderboard: {e}")
+        logger.error(f"clantop error: {e}")
+        await ctx.respond("Failed to fetch clan leaderboard. Please try again later.")
 
 
 # Move sync_commands to after all commands are defined
@@ -983,11 +1089,17 @@ async def on_guild_remove(guild):
 @bot.event
 async def on_error(event, *args, **kwargs):
     import traceback
-    logger.error(f"Error in event {event}:\n{traceback.format_exc()}")
-    channel = bot.get_channel(BOT_ERRORS_CHANNEL)
-    if channel:
-        error_msg = f"⚠️ Error in event `{event}`:\n```py\n{traceback.format_exc()}```"
-        await channel.send(error_msg[:2000])
+    error_text = traceback.format_exc()
+    logger.error(f"Error in event {event}:\n{error_text}")
+    # Prevent recursive crashes - wrap in try/except and don't re-raise
+    try:
+        channel = bot.get_channel(BOT_ERRORS_CHANNEL)
+        if channel:
+            # Truncate and sanitize error message
+            error_msg = f"⚠️ Error in event `{event}`:\n```py\n{error_text[:1800]}```"
+            await asyncio.wait_for(channel.send(error_msg), timeout=5.0)
+    except Exception as send_error:
+        logger.error(f"Failed to send error notification: {send_error}")
 
 
 # /playtime - Playtime leaderboard for Lifesteal and Survival
@@ -1005,13 +1117,15 @@ async def on_error(event, *args, **kwargs):
     ]
 )
 async def playtime(ctx: discord.ApplicationContext, mode: str):
+    if check_cooldown(ctx.author.id):
+        await ctx.respond("Please wait a few seconds before using commands again.", ephemeral=True)
+        return
+    
     await ctx.defer()
     try:
-        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
-        client = PIGDIClient(API_KEY)
-        # Map mode to gamemode
+        client = get_api_client()
         gamemode = "trojan" if mode == "lifesteal" else "spartan"
-        leaderboard = client._request("GET", f"/v1/ugc/{gamemode}/leaderboard/playtime?page=0&size=10")
+        leaderboard = await client.get(f"/v1/ugc/{gamemode}/leaderboard/playtime?page=0&size=10")
         entries = leaderboard.get("entries") or leaderboard.get("players") or leaderboard.get("leaderboard") or []
         if isinstance(entries, list) and entries:
             leaderboard_lines = []
@@ -1032,7 +1146,8 @@ async def playtime(ctx: discord.ApplicationContext, mode: str):
         else:
             await ctx.respond("No leaderboard data found.")
     except Exception as e:
-        await ctx.respond(f"Failed to fetch playtime leaderboard: {e}")
+        logger.error(f"playtime error: {e}")
+        await ctx.respond("Failed to fetch playtime leaderboard. Please try again later.")
 
 
 # /baltop command for various leaderboards
@@ -1060,14 +1175,15 @@ async def playtime(ctx: discord.ApplicationContext, mode: str):
     ]
 )
 async def baltop(ctx: discord.ApplicationContext, type: str):
+    if check_cooldown(ctx.author.id):
+        await ctx.respond("Please wait a few seconds before using commands again.", ephemeral=True)
+        return
+    
     await ctx.defer()
     try:
-        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
-        url = f"https://api.arch.mc/v1/economy/baltop/{type}"
-        headers = {"X-API-KEY": API_KEY}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
+        client = get_api_client()
+        data = await client.get(f"/v1/economy/baltop/{type}")
+        if data and isinstance(data, dict):
             entries = data.get("entries") or []
             if isinstance(entries, list) and entries:
                 leaderboard_lines = [
@@ -1085,9 +1201,10 @@ async def baltop(ctx: discord.ApplicationContext, type: str):
             else:
                 await ctx.respond("No baltop data found for that type.")
         else:
-            await ctx.respond(f"Failed to fetch baltop leaderboard. Status code: {response.status_code}")
+            await ctx.respond("No baltop data found for that type.")
     except Exception as e:
-        await ctx.respond(f"Failed to fetch baltop leaderboard: {e}")
+        logger.error(f"baltop error: {e}")
+        await ctx.respond("Failed to fetch baltop leaderboard. Please try again later.")
 
 @bot.slash_command(name="invite", description="Get the invite link for Archie")
 async def invite(ctx: discord.ApplicationContext):
@@ -1172,40 +1289,64 @@ async def help(ctx: discord.ApplicationContext):
     await ctx.respond(embed=embed)
 
 
-class PIGDIClient:
+class AsyncPIGDIClient:
+    """Async API client - prevents blocking the event loop."""
     BASE_URL = "https://api.arch.mc"
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.session = requests.Session()
-        self.session.headers.update({"X-API-KEY": self.api_key})
+        self._session: Optional[aiohttp.ClientSession] = None
 
-    def _request(self, method: str, path: str, **kwargs) -> Any:
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=10)
+            self._session = aiohttp.ClientSession(
+                headers={"X-API-KEY": self.api_key},
+                timeout=timeout
+            )
+        return self._session
+
+    async def _request(self, method: str, path: str) -> Any:
+        session = await self._get_session()
         url = f"{self.BASE_URL}{path}"
-        resp = self.session.request(method, url, **kwargs)
         try:
-            resp.raise_for_status()
-        except requests.HTTPError as e:
-            print(f"HTTP error: {e} - {resp.text}")
+            async with session.request(method, url) as resp:
+                if resp.status != 200:
+                    return None
+                if resp.content_type and resp.content_type.startswith("application/json"):
+                    return await resp.json()
+                return await resp.text()
+        except asyncio.TimeoutError:
+            logger.warning(f"API timeout: {path}")
             return None
-        if resp.headers.get("Content-Type", "").startswith("application/json"):
-            return resp.json()
-        return resp.text
+        except Exception as e:
+            logger.error(f"API error: {e}")
+            return None
 
-    # Example: Get all statistics for a player by username (UGC)
-    def get_ugc_player_stats_by_username(self, gamemode: str, username: str) -> Optional[Dict]:
+    async def get_ugc_player_stats_by_username(self, gamemode: str, username: str) -> Optional[Dict]:
         path = f"/v1/ugc/{gamemode}/players/username/{username}/statistics"
-        return self._request("GET", path)
+        return await self._request("GET", path)
 
-    # Example: Get leaderboard for a statistic (UGC)
-    def get_ugc_leaderboard(self, gamemode: str, stat_type: str, page: int = 0, size: int = 10) -> Optional[Dict]:
+    async def get_ugc_leaderboard(self, gamemode: str, stat_type: str, page: int = 0, size: int = 10) -> Optional[Dict]:
         path = f"/v1/ugc/{gamemode}/leaderboard/{stat_type}?page={page}&size={size}"
-        return self._request("GET", path)
+        return await self._request("GET", path)
 
-    # Example: Get all available statistic IDs
-    def list_statistics(self) -> Optional[Dict]:
-        path = "/v1/statistics"
-        return self._request("GET", path)
+    async def get(self, path: str) -> Optional[Dict]:
+        return await self._request("GET", path)
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+# Global async client instance
+_api_client: Optional[AsyncPIGDIClient] = None
+
+def get_api_client() -> AsyncPIGDIClient:
+    global _api_client
+    if _api_client is None:
+        API_KEY = os.getenv("ARCH_API_KEY") or "your-api-key-here"
+        _api_client = AsyncPIGDIClient(API_KEY)
+    return _api_client
 
 # Example usage
 if __name__ == "__main__":
