@@ -235,11 +235,35 @@ def generate_lifestats_card(username: str, uuid: str, statistics: dict, profile:
     return buf
 
 YEARLY_STATS_FILE = "yearly_stats.json"
+ERROR_LOG_CHANNEL_ID = 1454137711710703785
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s:%(name)s: %(message)s')
 logger = logging.getLogger('archie-bot')
 load_dotenv()
 bot = discord.Bot()
+
+async def log_error_to_channel(command: str, user: discord.User, guild: Optional[discord.Guild], error: Exception, extra: Optional[dict] = None):
+    """Send error details to the error logging channel."""
+    try:
+        channel = bot.get_channel(ERROR_LOG_CHANNEL_ID)
+        if not channel:
+            channel = await bot.fetch_channel(ERROR_LOG_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title="⚠️ Command Error",
+                color=discord.Color.red(),
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="Command", value=f"`/{command}`", inline=True)
+            embed.add_field(name="User", value=f"{user} ({user.id})", inline=True)
+            embed.add_field(name="Guild", value=f"{guild.name} ({guild.id})" if guild else "DM", inline=True)
+            embed.add_field(name="Error", value=f"```{type(error).__name__}: {str(error)[:500]}```", inline=False)
+            if extra:
+                for k, v in extra.items():
+                    embed.add_field(name=k, value=f"`{v}`", inline=True)
+            await channel.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Failed to log error to channel: {e}")
 
 # Daily stats tracking
 daily_stats = {
@@ -536,6 +560,7 @@ async def balance(ctx: discord.ApplicationContext, gamemode: str, username: str)
             await ctx.respond(f"No balance profile found for **{safe_username}**.")
     except Exception as e:
         logger.error(f"balance error: {e}")
+        await log_error_to_channel("balance", ctx.author, ctx.guild, e, {"username": safe_username, "gamemode": gamemode})
         await ctx.respond("Failed to fetch balance. Please try again later.")
 
 # /dueltop - Top players for a duel stat (ELO, wins, etc.)
@@ -589,6 +614,7 @@ async def dueltop(ctx: discord.ApplicationContext, statid: str):
             await ctx.respond("No duel leaderboard data found.")
     except Exception as e:
         logger.error(f"dueltop error: {e}")
+        await log_error_to_channel("dueltop", ctx.author, ctx.guild, e, {"statid": statid})
         await ctx.respond("Failed to fetch duel leaderboard. Please try again later.")
 
 # /duelstats - All duel stats for a username
@@ -772,6 +798,7 @@ async def duelstats(ctx: discord.ApplicationContext, username: str):
             await ctx.respond("No duel stats found for that player.")
     except Exception as e:
         logger.error(f"[duelstats] Exception for {safe_username}: {e}")
+        await log_error_to_channel("duelstats", ctx.author, ctx.guild, e, {"username": safe_username})
         await ctx.respond("Failed to fetch duel stats. Please try again later.")
 
 
@@ -821,7 +848,9 @@ async def lifetop(ctx: discord.ApplicationContext, stat: str):
         else:
             await ctx.respond("No leaderboard data found.")
     except Exception as e:
-        await ctx.respond(f"Failed to fetch leaderboard: {e}")
+        logger.error(f"lifetop error: {e}")
+        await log_error_to_channel("lifetop", ctx.author, ctx.guild, e, {"stat": stat})
+        await ctx.respond("Failed to fetch leaderboard. Please try again later.")
 
 # /lifestats - All Lifesteal stats for a username
 
@@ -919,6 +948,7 @@ async def lifestats(ctx: discord.ApplicationContext, username: str):
             await ctx.respond("No stats found for that player.")
     except Exception as e:
         logger.error(f"lifestats error: {e}")
+        await log_error_to_channel("lifestats", ctx.author, ctx.guild, e, {"username": safe_username})
         await ctx.respond("Failed to fetch stats. Please try again later.")
 
 # /lifestat - Specific Lifesteal stat for a username
@@ -1004,6 +1034,7 @@ async def lifestat(ctx: discord.ApplicationContext, username: str, stat: str):
                 await ctx.respond("No data found for that player/stat.")
     except Exception as e:
         logger.error(f"lifestat error: {e}")
+        await log_error_to_channel("lifestat", ctx.author, ctx.guild, e, {"username": safe_username, "stat": stat})
         await ctx.respond("Failed to fetch stat. Please try again later.")
 
 
@@ -1044,6 +1075,7 @@ async def clantop(ctx: discord.ApplicationContext):
             await ctx.respond("No clan leaderboard data found.")
     except Exception as e:
         logger.error(f"clantop error: {e}")
+        await log_error_to_channel("clantop", ctx.author, ctx.guild, e)
         await ctx.respond("Failed to fetch clan leaderboard. Please try again later.")
 
 
@@ -1175,6 +1207,7 @@ async def playtime(ctx: discord.ApplicationContext, mode: str):
             await ctx.respond("No leaderboard data found.")
     except Exception as e:
         logger.error(f"playtime error: {e}")
+        await log_error_to_channel("playtime", ctx.author, ctx.guild, e, {"mode": mode})
         await ctx.respond("Failed to fetch playtime leaderboard. Please try again later.")
 
 
@@ -1232,6 +1265,7 @@ async def baltop(ctx: discord.ApplicationContext, type: str):
             await ctx.respond("No baltop data found for that type.")
     except Exception as e:
         logger.error(f"baltop error: {e}")
+        await log_error_to_channel("baltop", ctx.author, ctx.guild, e, {"type": type})
         await ctx.respond("Failed to fetch baltop leaderboard. Please try again later.")
 
 @bot.slash_command(name="invite", description="Get the invite link for Archie")
