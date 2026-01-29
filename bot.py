@@ -86,7 +86,7 @@ def safe_json_save(filepath: str, data: dict) -> bool:
     return False
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template.png")
-FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "MinecraftRegular.ttf")
+FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "MinecraftRegular.otf")
 STEVE_HEAD_URL = "https://mc-heads.net/avatar/MHF_Steve/80"
 
 async def fetch_player_head(uuid: str) -> Optional[bytes]:
