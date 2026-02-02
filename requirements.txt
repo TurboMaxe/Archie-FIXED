@@ -1,6 +1,0 @@
-py-cord
-aiohttp
-python-dotenv
-matplotlib
-Pillow
-filelock
